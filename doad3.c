@@ -5,6 +5,8 @@
 #include <errno.h>
 #include <unistd.h>
 #include <string.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 #include <json-c/json.h>
 
 char *my_method = "GET";
@@ -17,7 +19,26 @@ char *capath;
 char *my_token;
 char *my_project;
 char *my_store;
+char *my_container;
+int vflag;
 int Vflag;
+
+char *
+fix_format_microseconds(char *ts)
+{
+	char *cp = strchr(ts, '.');
+	int c;
+	if (cp && strlen(cp) > 7) {
+		c = cp[7];
+		cp[7] = 0;
+		if (c >= '5') {
+			int us = strtoll(cp+1, 0, 0);
+			++us;
+			snprintf(cp+1, 7, "%06d", us);
+		}
+	}
+	return ts;
+}
 
 char *
 format_timespec(char *buf, int n, struct timespec *tv)
@@ -304,7 +325,7 @@ eat_keystone_data(char *in, uint size, uint num, void *h)
 			r, in);
 goto Done;
 	}
-if (Vflag) {
+if (vflag > 1) {
 	const char *response_json = json_object_to_json_string_ext(jobj, JSON_C_TO_STRING_PRETTY);
 printf ("RECV: <%s>\n", response_json);
 	}
@@ -396,7 +417,7 @@ get_token()
 	const char *req_json = json_object_to_json_string_ext(jobj, JSON_C_TO_STRING_PLAIN);
 	memset(recvarg, 0, sizeof *recvarg);
 	recvarg->json_tokeniser = json_tokener_new();
-if (Vflag) printf ("SEND: <%s>\n", req_json);
+if (vflag > 1) printf ("SEND: <%s>\n", req_json);
 	headers = curl_slist_append(headers, "Content-Type: " "application/json");
 	headers = curl_slist_append(headers, "Accept: " "application/json");
 	headers = curl_slist_append(headers, "Expect:");
@@ -434,14 +455,14 @@ Done:
 //	free(req_json);
 	if (temp_url) free(temp_url);
 	if (recvarg->authtoken) {
-if (Vflag) printf ("got auth-token: <%s>\n", recvarg->authtoken);
+if (vflag) printf ("got auth-token: <%s>\n", recvarg->authtoken);
 		my_token = strdup(recvarg->authtoken);	// how to free?
 	} else {
 		fprintf(stderr,"Failed to receive auth token\n");
 		r = 1;
 	}
 	if (recvarg->storage_url) {
-if (Vflag) printf ("got storage url: <%s>\n", recvarg->storage_url);
+if (vflag) printf ("got storage url: <%s>\n", recvarg->storage_url);
 		my_store = strdup(recvarg->storage_url);	// free?
 	} else {
 		fprintf(stderr,"Failed to find storage service\n");
@@ -463,7 +484,7 @@ struct exists_entry {
 int
 compute_exists_hash(char *fn)
 {
-	unsigned r;
+	unsigned r = 0;
 	char *cp;
 	for (cp = fn; *cp; ++cp) {
 		r *= 5;
@@ -477,6 +498,7 @@ void
 wait_until_exists(char *fn)
 {
 	int nh;
+int f = 0;
 	nh = compute_exists_hash(fn);
 	struct exists_entry *ep, **epp;
 	if (pthread_mutex_lock(&exists_mutex) < 0) {
@@ -496,9 +518,11 @@ wait_until_exists(char *fn)
 			continue;
 		}
 		if (ep->exists) break;
+if (f) printf ("%s still does not exist\n", fn);
 		if (pthread_cond_wait(&exists_cond, &exists_mutex) < 0) {
 			fprintf(stderr,"cond wait failed %d\n", errno);
 		}
+	f = 1;
 	}
 	if (pthread_mutex_unlock(&exists_mutex) < 0) {
 		fprintf(stderr,"unlock failed %d\n", errno);
@@ -527,7 +551,8 @@ mark_it_exists(char *fn)
 	}
 	ep->exists = 1;
 	if (ep->want) {
-		pthread_cond_signal(&exists_cond);
+printf ("%s does exist now\n", fn);
+		pthread_cond_broadcast(&exists_cond);
 	}
 	if (pthread_mutex_unlock(&exists_mutex) < 0) {
 		fprintf(stderr,"unlock failed %d\n", errno);
@@ -600,48 +625,75 @@ read_in_data()
 		cp += sizeof *wp;
 		memset(wp, 0, sizeof*wp);
 		wp->op = i;
-		wp->what = what;
+		wp->what = cp;
 		strcpy(cp, what);
 		*wpp = wp;
 		wpp = &wp->next;
 	}
 	return r;
 }
+struct make_data_arg {
+	FILE *fp;
+};
+
+
+uint
+make_data_function(char *in, uint size, uint num, void *h)
+{
+	struct make_data_arg *a = h;
+	uint r;
+	r = fread(in, size, num, a->fp);
+	return r;
+}
+
+
+uint
+ignore_data_function(char *in, uint size, uint num, void *h)
+{
+	uint r;
+	r = size * num;
+	return r;
+}
 
 pthread_t *worker_ids;
+
+struct worker_result {
+	int r;
+};
 
 void *
 worker_thread(void *a)
 {
 	struct curl_carrier *ca;
 	CURL *curl;
-	struct curl_slist *headers = 0;
+	struct curl_slist *headers;
 	CURLcode rc;
 	char error_buf[CURL_ERROR_SIZE];
 	long http_status;
-	int i;
+	int len_url;
+	int len_xauth;
+	int len_timestamp;
+	int r;
+	struct worker_result *wr;
 	struct work_element *wp;
 	struct work_element **wpp;
 	char *temp_url;
+	char *temp_xauth;
+	char temp_timestamp[80];
+	char timestamp_formatted[60];
+	CURLoption opt;
+	struct make_data_arg makedataarg[1];
+	int first;
+	struct stat stbuf;
 
+	wr = malloc(sizeof *wr);
 	ca = get_curl_handle();
 	curl = ca->h;
+	temp_url = malloc(len_url = strlen(my_store) + 80);
+	temp_xauth = malloc(len_xauth = strlen(my_token) + 80);
 
-	temp_url = malloc(i = strlen(my_store) + 80);
-
-	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-//	curl_easy_setopt(curl, CURLOPT_URL, temp_url);
-	curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 1L);
-	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-	curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, error_buf);
-//	curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void*)recvarg);
-//	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, eat_keystone_data);
-//	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, req_json);
-//	curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, strlen(req_json));
-//	curl_easy_setopt(curl, CURLOPT_HEADERDATA, (void*)recvarg);
-//	curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, eat_keystone_header);
-
-	for (;;) {
+	for (first = 1;;first = 0) {
+		headers = 0;
 		if (pthread_mutex_lock(&work_mutex) < 0) {
 			fprintf(stderr,"lock failed %d\n", errno);
 		}
@@ -656,16 +708,87 @@ worker_thread(void *a)
 		if (wp->op == W_DEL) {
 			wait_until_exists(wp->what);
 		}
+		if (!first)
+			curl_easy_reset(curl);
+
+		snprintf(temp_xauth, len_xauth, "X-Auth-Token: %s", my_token);
+		headers = curl_slist_append(headers, temp_xauth);
+//		headers = curl_slist_append(headers, "Content-Type: " "application/json");
+		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+		curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 1L);
+		curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+		curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, error_buf);
+//		curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void*)recvarg);
+		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, ignore_data_function);
+
+		snprintf (temp_url, len_url, "%s/%s/%s", my_store, my_container, wp->what);
+		switch (wp->op) {
+		case W_DEL:
+if (vflag) printf ("deleting %s\n", wp->what);
+			curl_easy_setopt(curl, CURLOPT_POSTFIELDS, NULL);
+			curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, 0);
+			curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
+			break;
+		case W_ADD:
+if (vflag) printf ("adding %s\n", wp->what);
+			memset(makedataarg, 0, sizeof *makedataarg);
+			makedataarg->fp = fopen(wp->what, "r");
+			if (!makedataarg->fp) {
+				fprintf(stderr,"Can't open %s\n", wp->what);
+				continue;
+			}
+			if (fstat(fileno(makedataarg->fp), &stbuf) < 0) {
+				fprintf(stderr,"Can't stat %s\n", wp->what);
+				continue;
+			}
+			snprintf(temp_timestamp, sizeof temp_timestamp,
+				"X-object-meta-mtime: %s",
+					fix_format_microseconds(
+					format_timespec(timestamp_formatted, sizeof timestamp_formatted,
+					&stbuf.st_mtim)));
+			headers = curl_slist_append(headers, temp_timestamp);
+			curl_easy_setopt(curl, CURLOPT_READFUNCTION, make_data_function);
+			curl_easy_setopt(curl, CURLOPT_READDATA, makedataarg);
+			curl_easy_setopt(curl, CURLOPT_UPLOAD, 1);
+			break;
+		default:
+			fprintf(stderr,"op %d? for fn %s\n", wp->op, wp->what);
+			continue;
+		}
+		curl_easy_setopt(curl, CURLOPT_URL, temp_url);
 		// DO IT HERE
+		rc = curl_easy_perform(curl);
+		if (rc != CURLE_OK) {
+			fprintf(stderr,"curl_easy_perform failed, %s\n",
+				curl_easy_strerror(rc));
+			r |= 2;
+			goto Next;
+		}
+		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_status);
+		if (http_status < 200 || http_status > 299) {
+			fprintf (stderr,"While %s on %s: got %d\n",
+				wp->op==W_ADD ? "adding" : "deleting",
+				wp->what,
+				http_status);
+		}
+	Next:
 		if (wp->op == W_ADD) {
 			mark_it_exists(wp->what);
 		}
+		curl_slist_free_all(headers);
 		free(wp);
 	}
 Done:
 	release_curl_handle(ca);
 	free(temp_url);
-	return 0;
+	free(temp_xauth);
+	if (r) {
+		wr->r = r;
+	} else {
+		free(wr);
+		wr = 0;
+	}
+	return wr;
 }
 
 void
@@ -682,10 +805,18 @@ wait_for_completion()
 {
 	int i;
 	void *result;
+	int r;
+	struct worker_result *wr;
+	r = 0;
 	for (i = 0; i < nt; ++i) {
 		if (pthread_join(worker_ids[i], &result) < 0) {
 			fprintf(stderr,"pthread_join failed %d\n", errno);
 			return;
+		}
+		wr = result;
+		if (wr) {
+			r |= wr->r;
+			free(wr);
 		}
 	}
 	free(worker_ids);
@@ -740,9 +871,9 @@ main(int ac, char **av)
 		my_url = getenv("OS_AUTH_URL");
 
 	while (--ac > 0) if (*(ap = *++av) == '-') while (*++ap) switch(*ap) {
-//	case 'v':
-//		++vflag;
-//		break;
+	case 'v':
+		++vflag;
+		break;
 	case '-':
 		break;
 	case 'C':
@@ -790,6 +921,13 @@ main(int ac, char **av)
 		--ac;
 		my_user = *++av;
 		break;
+	case 'b':
+		if (ac < 1) {
+			goto Usage;
+		}
+		--ac;
+		my_container = *++av;
+		break;
 	case 'p':
 		if (ac < 1) {
 			goto Usage;
@@ -830,7 +968,7 @@ main(int ac, char **av)
 		break;
 	default:
 	Usage:
-		fprintf(stderr,"Usage: doad3 [-u user] [-p pass] [-P proj] [-t #threads] [-h hosturl] [-C capath] [-V]\n");
+		fprintf(stderr,"Usage: doad3 [-u user] [-p pass] [-P proj] [-t #threads] [-h hosturl] [-C capath] [-V] -b container\n");
 		exit(1);
 	} else if (!my_url) {
 		my_url = ap;
@@ -840,6 +978,10 @@ main(int ac, char **av)
 	}
 	if (nt <= 0) {
 		fprintf(stderr,"Bad thread count %d\n", nt);
+		goto Usage;
+	}
+	if (!my_container) {
+		fprintf(stderr,"must specific -b container\n");
 		goto Usage;
 	}
 	if (!my_user)
