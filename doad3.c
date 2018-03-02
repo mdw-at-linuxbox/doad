@@ -194,9 +194,93 @@ flush_curl_handles()
 	}
 }
 
+int
+iterate_json_array(struct json_object *ar, int (*f)(), void *a)
+{
+	int i, c;
+	int r = 0;
+	json_object *item;
+	if (!json_object_is_type(ar, json_type_array))
+		return -1;
+	c = json_object_array_length(ar);
+	for (i = 0; i < c; ++i) {
+		item = json_object_array_get_idx(ar, i);
+		r = f(a, item);
+		if (r) break;
+	}
+	return r;
+}
+
 struct token_arg {
 	struct json_tokener *json_tokeniser;
+	char *authtoken;
+	const char *storage_url;
 };
+
+int
+eat_keystone_endpoint(void *h, json_object *ep)
+{
+	struct token_arg *a = h;
+	struct json_object *jo;
+
+#if 0
+	const char *endpoint_json = json_object_to_json_string_ext(ep, JSON_C_TO_STRING_PRETTY);
+	printf("endpoint: <%s>\n", endpoint_json);
+#endif
+
+	if (!json_object_object_get_ex(ep, "interface", &jo)) {
+		fprintf(stderr,"Can't find interface in endpoint\n");
+		return -1;
+	}
+	if (!json_object_is_type(jo, json_type_string)) {
+		fprintf(stderr,"weird interface in endpoint\n");
+		return -1;
+	}
+	const char *s = json_object_get_string(jo);
+
+	if (strcmp(s, "public"))
+		return 0;
+
+	if (!json_object_object_get_ex(ep, "url", &jo)) {
+		fprintf(stderr,"Can't find url in endpoint\n");
+		return -1;
+	}
+	if (!json_object_is_type(jo, json_type_string)) {
+		fprintf(stderr,"weird url in endpoint\n");
+		return -1;
+	}
+	a->storage_url = json_object_get_string(jo);
+	return 0;
+}
+
+int
+eat_keystone_catalog(void *h, json_object *ep)
+{
+	struct json_object *jo;
+	if (!json_object_object_get_ex(ep, "type", &jo)) {
+		fprintf(stderr,"Can't find type in catalog entry\n");
+		return -1;
+	}
+	if (!json_object_is_type(jo, json_type_string)) {
+		fprintf(stderr,"weird type in catalog entry\n");
+		return -1;
+	}
+	const char *s = json_object_get_string(jo);
+
+	if (strcmp(s, "object-store"))
+		return 0;
+
+	struct json_object *je;
+	if (!json_object_object_get_ex(ep, "endpoints", &je)) {
+		fprintf(stderr,"Can't find endpoints in catalog entry\n");
+		return -1;
+	}
+	if (!json_object_is_type(je, json_type_array)) {
+		fprintf(stderr,"weird endpoints in catalog entry\n");
+		return -1;
+	}
+	return iterate_json_array(je, eat_keystone_endpoint, h);
+}
 
 uint
 eat_keystone_data(char *in, uint size, uint num, void *h)
@@ -205,6 +289,7 @@ eat_keystone_data(char *in, uint size, uint num, void *h)
 	r = size * num;
 	struct token_arg *a = h;
 	json_object *jobj;
+	json_object *token, *catalog;
 	enum json_tokener_error je;
 #if 0
 	fprintf(stdout,"Received: ");
@@ -215,10 +300,51 @@ eat_keystone_data(char *in, uint size, uint num, void *h)
 	if (je != json_tokener_success) {
 		fprintf(stderr,"Cannot parse json: e=%d string=<%.*s>\n",
 			r, in);
-	} else {
-		const char *response_json = json_object_to_json_string_ext(jobj, JSON_C_TO_STRING_PRETTY);
-// if (Vflag)
+goto Done;
+	}
+if (Vflag) {
+	const char *response_json = json_object_to_json_string_ext(jobj, JSON_C_TO_STRING_PRETTY);
 printf ("RECV: <%s>\n", response_json);
+	}
+	if (!json_object_object_get_ex(jobj, "token", &token)) {
+		fprintf(stderr,"Can't find token in response\n");
+		goto Done;
+	}
+	if (!json_object_object_get_ex(token, "catalog", &catalog)) {
+		fprintf(stderr,"Can't find catalog in token from response\n");
+		goto Done;
+	}
+	iterate_json_array(catalog, eat_keystone_catalog, h);
+Done:
+	return r;
+}
+
+// XXX in the case of redirects, should accept x-subject-token only from
+//  LAST response.  How?
+size_t
+eat_keystone_header(char *buffer, uint size, uint num, void *h)
+{
+	uint r;
+	static char subjecttoken[] = "X-Subject-Token:";
+	r = size * num;
+	struct token_arg *a = h;
+	if (!strncasecmp(buffer, subjecttoken, sizeof subjecttoken-1)) {
+		char *cp = malloc(r + 5);
+		char *inp = buffer; uint s = r;
+		inp += sizeof subjecttoken-1;
+		s -= sizeof subjecttoken-1;
+		while (s && *inp == ' ') {
+			--s; ++inp;
+		}
+		if (s) {
+			memcpy(cp, inp, s);
+			cp[s] = 0;
+			inp = strchr(cp, '\r');
+			if (inp) *inp = 0;
+			inp = strchr(cp, '\n');
+			if (inp) *inp = 0;
+			a->authtoken = cp;
+		}
 	}
 	return r;
 }
@@ -242,22 +368,31 @@ get_token()
 	json_object *jm = json_object_new_array();
 	json_object *jy = json_object_new_object();
 	json_object *jz = json_object_new_object();
+	json_object *jdom = json_object_new_object();
 	json_object *jobj = json_object_new_object();
+	json_object *jproj = json_object_new_object();
 
 	temp_url = malloc(i = strlen(my_url) + 30);
 	snprintf(temp_url, i, "%s/auth/tokens", my_url);
+	json_object_object_add(jdom, "name", json_object_new_string("Default"));
 	json_object_array_add(jm, json_object_new_string("password"));
-	json_object_object_add(jx, "name", json_object_new_string("Default"));
-	json_object_object_add(jpu, "domain", jx);
+//	json_object_object_add(jx, "name", json_object_new_string("Default"));
+//	json_object_object_add(jpu, "domain", jx);
+	json_object_object_add(jpu, "domain", jdom);
+	json_object_object_add(jproj, "name", json_object_new_string(my_tenant));
+	json_object_object_add(jproj, "domain", jdom);
+	json_object_object_add(jx, "project", jproj);
 	json_object_object_add(jpu, "name", json_object_new_string(my_user));
 	json_object_object_add(jpu, "password", json_object_new_string(my_password));
 	json_object_object_add(jy, "user", jpu);
 	json_object_object_add(jt, "password", jy);
 	json_object_object_add(jt, "methods", jm);
 	json_object_object_add(jz, "identity", jt);
+	json_object_object_add(jz, "scope", jx);
 	json_object_object_add(jobj, "auth", jz);
 
 	const char *req_json = json_object_to_json_string_ext(jobj, JSON_C_TO_STRING_PLAIN);
+	memset(recvarg, 0, sizeof *recvarg);
 	recvarg->json_tokeniser = json_tokener_new();
 if (Vflag) printf ("SEND: <%s>\n", req_json);
 	headers = curl_slist_append(headers, "Content-Type: " "application/json");
@@ -276,6 +411,8 @@ if (Vflag) printf ("SEND: <%s>\n", req_json);
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, eat_keystone_data);
 	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, req_json);
 	curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, strlen(req_json));
+	curl_easy_setopt(curl, CURLOPT_HEADERDATA, (void*)recvarg);
+	curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, eat_keystone_header);
 	if (Vflag) {
 		curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
 	}
@@ -294,6 +431,13 @@ Done:
 	curl_slist_free_all(headers);
 //	free(req_json);
 	if (temp_url) free(temp_url);
+	if (recvarg->authtoken) {
+printf ("got auth-token: <%s>\n", recvarg->authtoken);
+printf ("got storage url: <%s>\n", recvarg->storage_url);
+	} else {
+		fprintf(stderr,"Failed to receive auth token\n");
+		r = 1;
+	}
 	return r;
 }
 
