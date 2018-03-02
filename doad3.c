@@ -12,9 +12,11 @@ char *my_user;
 char *my_password;
 char *my_url;
 int multi_count;
+int nt = 1;
 char *capath;
 char *my_token;
-char *my_tenant;
+char *my_project;
+char *my_store;
 int Vflag;
 
 char *
@@ -379,7 +381,7 @@ get_token()
 //	json_object_object_add(jx, "name", json_object_new_string("Default"));
 //	json_object_object_add(jpu, "domain", jx);
 	json_object_object_add(jpu, "domain", jdom);
-	json_object_object_add(jproj, "name", json_object_new_string(my_tenant));
+	json_object_object_add(jproj, "name", json_object_new_string(my_project));
 	json_object_object_add(jproj, "domain", jdom);
 	json_object_object_add(jx, "project", jproj);
 	json_object_object_add(jpu, "name", json_object_new_string(my_user));
@@ -432,13 +434,104 @@ Done:
 //	free(req_json);
 	if (temp_url) free(temp_url);
 	if (recvarg->authtoken) {
-printf ("got auth-token: <%s>\n", recvarg->authtoken);
-printf ("got storage url: <%s>\n", recvarg->storage_url);
+if (Vflag) printf ("got auth-token: <%s>\n", recvarg->authtoken);
+		my_token = strdup(recvarg->authtoken);	// how to free?
 	} else {
 		fprintf(stderr,"Failed to receive auth token\n");
 		r = 1;
 	}
+	if (recvarg->storage_url) {
+if (Vflag) printf ("got storage url: <%s>\n", recvarg->storage_url);
+		my_store = strdup(recvarg->storage_url);	// free?
+	} else {
+		fprintf(stderr,"Failed to find storage service\n");
+		r = 1;
+	}
 	return r;
+}
+
+pthread_mutex_t exists_mutex;
+pthread_cond_t exists_cond;
+#define NH 55
+struct exists_entry {
+	struct exists_entry *next;
+	int exists;
+	int want;
+	char fn[1];
+} *exists_hash[NH];
+
+int
+compute_exists_hash(char *fn)
+{
+	unsigned r;
+	char *cp;
+	for (cp = fn; *cp; ++cp) {
+		r *= 5;
+		r ^= *cp;
+	}
+	r %= NH;
+	return (int) r;
+}
+
+void
+wait_until_exists(char *fn)
+{
+	int nh;
+	nh = compute_exists_hash(fn);
+	struct exists_entry *ep, **epp;
+	if (pthread_mutex_lock(&exists_mutex) < 0) {
+		fprintf(stderr,"lock failed %d\n", errno);
+	}
+	for (;;) {
+		for (epp = exists_hash + nh; ep = *epp; epp = &ep->next) {
+			if (!strcmp(ep->fn, fn)) break;
+		}
+		if (!ep) {
+			ep = malloc(sizeof *ep + strlen(fn));
+			memset(ep, 0, sizeof *ep);
+			strcpy(ep->fn, fn);
+			ep->want = 1;
+			ep->next = *epp;
+			*epp = ep;
+			continue;
+		}
+		if (ep->exists) break;
+		if (pthread_cond_wait(&exists_cond, &exists_mutex) < 0) {
+			fprintf(stderr,"cond wait failed %d\n", errno);
+		}
+	}
+	if (pthread_mutex_unlock(&exists_mutex) < 0) {
+		fprintf(stderr,"unlock failed %d\n", errno);
+	}
+}
+
+void
+mark_it_exists(char *fn)
+{
+	int nh;
+	nh = compute_exists_hash(fn);
+	struct exists_entry *ep, **epp;
+
+	if (pthread_mutex_lock(&exists_mutex) < 0) {
+		fprintf(stderr,"lock failed %d\n", errno);
+	}
+	for (epp = exists_hash + nh; ep = *epp; epp = &ep->next) {
+		if (!strcmp(ep->fn, fn)) break;
+	}
+	if (!ep) {
+		ep = malloc(sizeof *ep + strlen(fn));
+		memset(ep, 0, sizeof *ep);
+		strcpy(ep->fn, fn);
+		ep->next = *epp;
+		*epp = ep;
+	}
+	ep->exists = 1;
+	if (ep->want) {
+		pthread_cond_signal(&exists_cond);
+	}
+	if (pthread_mutex_unlock(&exists_mutex) < 0) {
+		fprintf(stderr,"unlock failed %d\n", errno);
+	}
 }
 
 #define W_ADD 1
@@ -450,6 +543,7 @@ struct work_element {
 };
 
 struct work_element *work_queue;
+pthread_mutex_t work_mutex;
 
 int
 read_in_data()
@@ -514,19 +608,100 @@ read_in_data()
 	return r;
 }
 
+pthread_t *worker_ids;
+
+void *
+worker_thread(void *a)
+{
+	struct curl_carrier *ca;
+	CURL *curl;
+	struct curl_slist *headers = 0;
+	CURLcode rc;
+	char error_buf[CURL_ERROR_SIZE];
+	long http_status;
+	int i;
+	struct work_element *wp;
+	struct work_element **wpp;
+	char *temp_url;
+
+	ca = get_curl_handle();
+	curl = ca->h;
+
+	temp_url = malloc(i = strlen(my_store) + 80);
+
+	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+//	curl_easy_setopt(curl, CURLOPT_URL, temp_url);
+	curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 1L);
+	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+	curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, error_buf);
+//	curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void*)recvarg);
+//	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, eat_keystone_data);
+//	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, req_json);
+//	curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, strlen(req_json));
+//	curl_easy_setopt(curl, CURLOPT_HEADERDATA, (void*)recvarg);
+//	curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, eat_keystone_header);
+
+	for (;;) {
+		if (pthread_mutex_lock(&work_mutex) < 0) {
+			fprintf(stderr,"lock failed %d\n", errno);
+		}
+		for (wpp = & work_queue; wp = *wpp; ) {
+			*wpp = wp->next;
+			break;
+		}
+		if (pthread_mutex_unlock(&work_mutex) < 0) {
+			fprintf(stderr,"unlock failed %d\n", errno);
+		}
+		if (!wp) break;
+		if (wp->op == W_DEL) {
+			wait_until_exists(wp->what);
+		}
+		// DO IT HERE
+		if (wp->op == W_ADD) {
+			mark_it_exists(wp->what);
+		}
+		free(wp);
+	}
+Done:
+	release_curl_handle(ca);
+	free(temp_url);
+	return 0;
+}
+
 void
 start_threads()
 {
+	int i;
+	worker_ids = malloc(nt * sizeof *worker_ids);
+	for (i = 0; i < nt; ++i)
+		pthread_create(worker_ids + i, NULL, worker_thread, NULL);
 }
 
 void
 wait_for_completion()
 {
+	int i;
+	void *result;
+	for (i = 0; i < nt; ++i) {
+		if (pthread_join(worker_ids[i], &result) < 0) {
+			fprintf(stderr,"pthread_join failed %d\n", errno);
+			return;
+		}
+	}
+	free(worker_ids);
+	worker_ids = 0;
 }
 
 void
 report_results()
 {
+}
+
+void
+free_other_stuff()
+{
+	// free my_store sometimes?
+	// free my_token sometimes?
 }
 
 int process()
@@ -559,8 +734,8 @@ main(int ac, char **av)
 		my_user = getenv("OS_USERNAME");
 	if (!my_password)
 		my_password = getenv("OS_PASSWORD");
-	if (!my_tenant)
-		my_tenant = getenv("OS_PROJECT_NAME");
+	if (!my_project)
+		my_project = getenv("OS_PROJECT_NAME");
 	if (!my_url)
 		my_url = getenv("OS_AUTH_URL");
 
@@ -580,6 +755,13 @@ main(int ac, char **av)
 	case 'V':
 		++Vflag;
 		break;
+	case 'S':
+		if (ac < 1) {
+			goto Usage;
+		}
+		--ac;
+		my_store = *++av;
+		break;
 	case 'T':
 		if (ac < 1) {
 			goto Usage;
@@ -587,12 +769,12 @@ main(int ac, char **av)
 		--ac;
 		my_token = *++av;
 		break;
-	case 't':
+	case 'P':
 		if (ac < 1) {
 			goto Usage;
 		}
 		--ac;
-		my_tenant = *++av;
+		my_project = *++av;
 		break;
 	case 'c':
 		if (ac < 1) {
@@ -622,6 +804,18 @@ main(int ac, char **av)
 		--ac;
 		my_url = *++av;
 		break;
+	case 't':
+		if (ac < 1) {
+			goto Usage;
+		}
+		--ac;
+		cp = *++av;
+		nt = strtoll(cp, &ep, 0);
+		if (cp == ep || *ep) {
+			fprintf(stderr,"Can't parse thread count <%s>\n", cp);
+			goto Usage;
+		}
+		break;
 	case 'm':
 		if (ac < 1) {
 			goto Usage;
@@ -636,7 +830,7 @@ main(int ac, char **av)
 		break;
 	default:
 	Usage:
-		fprintf(stderr,"Usage: doad3 [-u x] [-p x] [-t x] [-h hosturl] [-C capath] [-V]\n");
+		fprintf(stderr,"Usage: doad3 [-u user] [-p pass] [-P proj] [-t #threads] [-h hosturl] [-C capath] [-V]\n");
 		exit(1);
 	} else if (!my_url) {
 		my_url = ap;
@@ -644,14 +838,20 @@ main(int ac, char **av)
 		fprintf(stderr,"extra arg?\n");
 		goto Usage;
 	}
+	if (nt <= 0) {
+		fprintf(stderr,"Bad thread count %d\n", nt);
+		goto Usage;
+	}
 	if (!my_user)
 		my_user = getenv("OS_USERNAME");
 	if (!my_password)
 		my_password = getenv("OS_PASSWORD");
-	if (!my_tenant)
-		my_tenant = getenv("OS_TENANT_NAME");
+	if (!my_project)
+		my_project = getenv("OS_PROJECT_NAME");
 	if (!my_url)
 		my_url = getenv("OS_AUTH_URL");
+	if (!my_store)
+		my_store = getenv("OS_STORAGE_URL");
 
 	if (!change_here)
 		;
@@ -664,5 +864,6 @@ main(int ac, char **av)
 	r = process();
 	flush_curl_handles();
 	curl_global_cleanup();
+	free_other_stuff();
 	exit(r);
 }
