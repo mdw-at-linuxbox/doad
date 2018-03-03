@@ -498,7 +498,6 @@ void
 wait_until_exists(char *fn)
 {
 	int nh;
-int f = 0;
 	nh = compute_exists_hash(fn);
 	struct exists_entry *ep, **epp;
 	if (pthread_mutex_lock(&exists_mutex) < 0) {
@@ -518,11 +517,9 @@ int f = 0;
 			continue;
 		}
 		if (ep->exists) break;
-if (f) printf ("%s still does not exist\n", fn);
 		if (pthread_cond_wait(&exists_cond, &exists_mutex) < 0) {
 			fprintf(stderr,"cond wait failed %d\n", errno);
 		}
-	f = 1;
 	}
 	if (pthread_mutex_unlock(&exists_mutex) < 0) {
 		fprintf(stderr,"unlock failed %d\n", errno);
@@ -551,7 +548,6 @@ mark_it_exists(char *fn)
 	}
 	ep->exists = 1;
 	if (ep->want) {
-printf ("%s does exist now\n", fn);
 		pthread_cond_broadcast(&exists_cond);
 	}
 	if (pthread_mutex_unlock(&exists_mutex) < 0) {
