@@ -1,0 +1,4 @@
+#
+# unset environment variables related to openstack/swift authentication.
+#
+eval `env | sed -n 's%^\(ST_[^=]*\)=.*% \1%;s%^\(OS_[^=]*\)=.*% \1%;t s;b f;: s;H;: f;${g;s%\n%%g;s%^ %unset %;p}'`
