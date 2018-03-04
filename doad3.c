@@ -990,6 +990,8 @@ main(int ac, char **av)
 		my_url = getenv("OS_AUTH_URL");
 	if (!my_store)
 		my_store = getenv("OS_STORAGE_URL");
+	if (!my_token)
+		my_token = getenv("OS_AUTH_TOKEN");
 
 	if (!change_here)
 		;
