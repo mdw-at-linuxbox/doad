@@ -14,6 +14,7 @@ char *my_user;
 char *my_password;
 char *my_url;
 int multi_count;
+int fixed_size;
 int nt = 1;
 char *capath;
 char *my_token;
@@ -630,6 +631,7 @@ read_in_data()
 }
 struct make_data_arg {
 	FILE *fp;
+	int off;
 };
 
 
@@ -638,7 +640,16 @@ make_data_function(char *in, uint size, uint num, void *h)
 {
 	struct make_data_arg *a = h;
 	uint r;
-	r = fread(in, size, num, a->fp);
+	int c;
+	if (a->fp)
+		r = fread(in, size, num, a->fp);
+	else {
+		r = size * num;
+		c = fixed_size - a->off;
+		if (r > c) r = c;
+		memset(in, 0, r);
+		a->off += r;
+	}
 	return r;
 }
 
@@ -718,6 +729,7 @@ worker_thread(void *a)
 		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, ignore_data_function);
 
 		snprintf (temp_url, len_url, "%s/%s/%s", my_store, my_container, wp->what);
+		memset(makedataarg, 0, sizeof *makedataarg);
 		switch (wp->op) {
 		case W_DEL:
 if (vflag) printf ("deleting %s\n", wp->what);
@@ -727,15 +739,18 @@ if (vflag) printf ("deleting %s\n", wp->what);
 			break;
 		case W_ADD:
 if (vflag) printf ("adding %s\n", wp->what);
-			memset(makedataarg, 0, sizeof *makedataarg);
-			makedataarg->fp = fopen(wp->what, "r");
-			if (!makedataarg->fp) {
-				fprintf(stderr,"Can't open %s\n", wp->what);
-				continue;
-			}
-			if (fstat(fileno(makedataarg->fp), &stbuf) < 0) {
-				fprintf(stderr,"Can't stat %s\n", wp->what);
-				continue;
+			if (fixed_size) {
+				clock_gettime(CLOCK_REALTIME, &stbuf.st_mtim);
+			} else {
+				makedataarg->fp = fopen(wp->what, "r");
+				if (!makedataarg->fp) {
+					fprintf(stderr,"Can't open %s\n", wp->what);
+					continue;
+				}
+				if (fstat(fileno(makedataarg->fp), &stbuf) < 0) {
+					fprintf(stderr,"Can't stat %s\n", wp->what);
+					continue;
+				}
 			}
 			snprintf(temp_timestamp, sizeof temp_timestamp,
 				"X-object-meta-mtime: %s",
@@ -761,7 +776,7 @@ if (vflag) printf ("adding %s\n", wp->what);
 			goto Next;
 		}
 		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_status);
-		if (wp->op == W_ADD)
+		if (makedataarg->fp)
 			fclose(makedataarg->fp);
 		if (http_status < 200 || http_status > 299) {
 			fprintf (stderr,"While %s on %s: got %d\n",
@@ -919,6 +934,18 @@ main(int ac, char **av)
 		--ac;
 		my_user = *++av;
 		break;
+	case 's':
+		if (ac < 1) {
+			goto Usage;
+		}
+		--ac;
+		cp = *++av;
+		fixed_size = strtoll(cp, &ep, 0);
+		if (cp == ep || *ep) {
+			fprintf(stderr,"Bad multicount <%s>\n", cp);
+			goto Usage;
+		}
+		break;
 	case 'b':
 		if (ac < 1) {
 			goto Usage;
@@ -966,7 +993,7 @@ main(int ac, char **av)
 		break;
 	default:
 	Usage:
-		fprintf(stderr,"Usage: doad3 [-u user] [-p pass] [-P proj] [-t #threads] [-h hosturl] [-C capath] [-V] -b container\n");
+		fprintf(stderr,"Usage: doad3 [-u user] [-p pass] [-P proj] [-t #threads] [-h hosturl] [-C capath] [-V] [-s size] -b container\n");
 		exit(1);
 	} else if (!my_url) {
 		my_url = ap;
