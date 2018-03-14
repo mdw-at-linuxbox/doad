@@ -761,6 +761,8 @@ if (vflag) printf ("adding %s\n", wp->what);
 			goto Next;
 		}
 		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_status);
+		if (wp->op == W_ADD)
+			fclose(makedataarg->fp);
 		if (http_status < 200 || http_status > 299) {
 			fprintf (stderr,"While %s on %s: got %d\n",
 				wp->op==W_ADD ? "adding" : "deleting",
