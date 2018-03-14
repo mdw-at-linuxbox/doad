@@ -321,7 +321,7 @@ eat_keystone_data(char *in, uint size, uint num, void *h)
 	jobj = json_tokener_parse_ex(a->json_tokeniser, in, r);
 	je = json_tokener_get_error(a->json_tokeniser);
 	if (je != json_tokener_success) {
-		fprintf(stderr,"Cannot parse json: e=%d string=<%.*s>\n",
+		fprintf(stderr,"Cannot parse json: e=%d string=<%s>\n",
 			r, in);
 goto Done;
 	}
@@ -767,7 +767,7 @@ if (vflag) printf ("adding %s\n", wp->what);
 			fprintf (stderr,"While %s on %s: got %d\n",
 				wp->op==W_ADD ? "adding" : "deleting",
 				wp->what,
-				http_status);
+				(int) http_status);
 		}
 	Next:
 		if (wp->op == W_ADD) {
