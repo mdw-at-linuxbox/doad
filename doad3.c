@@ -458,6 +458,13 @@ eat_keystone_header(char *buffer, uint size, uint num, void *h)
 	return r;
 }
 
+pthread_mutex_t token_mutex;
+struct timespec received_expires_at;
+char *received_storage_url;
+char *received_token;
+
+#define MIN_EXPIRES 25
+
 int
 get_token()
 {
@@ -541,40 +548,92 @@ Done:
 //	free(req_json);
 	if (temp_url) free(temp_url);
 	if (recvarg->authtoken) {
-if (vflag) printf ("got auth-token: <%s>\n", recvarg->authtoken);
-		my_token = strdup(recvarg->authtoken);	// how to free?
+		if (received_token)
+			free(received_token);
+		received_token = strdup(recvarg->authtoken);	// how to free?
 	} else {
 		fprintf(stderr,"Failed to receive auth token\n");
 		r = 1;
 	}
 	if (recvarg->storage_url) {
-if (vflag) printf ("got storage url: <%s>\n", recvarg->storage_url);
-		my_store = strdup(recvarg->storage_url);	// free?
+		if (received_storage_url)
+			free(received_storage_url);
+		received_storage_url = strdup(recvarg->storage_url);	// free?
 	} else {
 		fprintf(stderr,"Failed to find storage service\n");
 		r = 1;
 	}
-	if (recvarg->expires_at.tv_sec) {
+	received_expires_at = recvarg->expires_at;
+	return r;
+}
+
+void
+report_on_token()
+{
+	if (received_token)
+		printf ("got auth-token: <%s>\n", received_token);
+	if (received_storage_url)
+		printf ("got storage url: <%s>\n", received_storage_url);
+	if (received_expires_at.tv_sec) {
 		struct timespec now[1], dur[1];
 		if (clock_gettime(CLOCK_REALTIME, now) < 0) {
 			fprintf(stderr,"gettime failed %d\n", errno);
-			fprintf(stderr,"Token expires at %d.%09d seconds\n",
-			recvarg->expires_at.tv_sec,
-			recvarg->expires_at.tv_nsec);
+			printf("Token expires at %d.%09d seconds\n",
+			received_expires_at.tv_sec,
+			received_expires_at.tv_nsec);
 		} else {
-			dur->tv_sec = recvarg->expires_at.tv_sec - now->tv_sec;
-			dur->tv_nsec = recvarg->expires_at.tv_nsec - now->tv_nsec;
+			dur->tv_sec = received_expires_at.tv_sec - now->tv_sec;
+			dur->tv_nsec = received_expires_at.tv_nsec - now->tv_nsec;
 			if (dur->tv_nsec < 0) {
 				dur->tv_sec -= 1;
 				dur->tv_nsec += 1000000000;
 			}
-			fprintf(stderr,"token expires in %d.%09d seconds\n",
+			printf("token expires in %d.%09d seconds\n",
 				dur->tv_sec,
 				dur->tv_nsec);
 		}
 	} else {
 		fprintf(stderr,"token does not expire\n");
 	}
+}
+
+int
+need_to_get_token()
+{
+	struct timespec now[1], dur[1];
+	if (my_token) return 0;
+	if (!received_token) return 1;
+	if (!received_expires_at.tv_sec) return 0;
+	if (clock_gettime(CLOCK_REALTIME, now) < 0) {
+		fprintf(stderr,"gettime failed %d\n", errno);
+		exit(1);
+	}
+	dur->tv_sec = received_expires_at.tv_sec - now->tv_sec;
+	dur->tv_nsec = received_expires_at.tv_nsec - now->tv_nsec;
+	if (dur->tv_nsec < 0) {
+		dur->tv_sec -= 1;
+		dur->tv_nsec += 1000000000;
+	}
+	return dur->tv_sec < MIN_EXPIRES;
+}
+
+int
+maybe_refresh_token()
+{
+	int r = 0;
+	if (!need_to_get_token()) return 0;
+	if (pthread_mutex_lock(&token_mutex) < 0) {
+		fprintf(stderr,"lock failed %d\n", errno);
+	}
+	if (need_to_get_token()) {
+		r = 1;
+		get_token();
+	}
+	if (pthread_mutex_unlock(&token_mutex) < 0) {
+		fprintf(stderr,"unlock failed %d\n", errno);
+	}
+	if (r && vflag)
+		report_on_token();
 	return r;
 }
 
@@ -798,14 +857,20 @@ worker_thread(void *a)
 	struct make_data_arg makedataarg[1];
 	int first;
 	struct stat stbuf;
+	char *using_this_store;
+	char *using_this_token;
 
+	maybe_refresh_token();
+	using_this_store = my_store ? my_store : received_storage_url;
+	using_this_token = my_token ? my_token : received_token;
 	wr = malloc(sizeof *wr);
 	ca = get_curl_handle();
 	curl = ca->h;
-	temp_url = malloc(len_url = strlen(my_store) + 80);
-	temp_xauth = malloc(len_xauth = strlen(my_token) + 80);
+	temp_url = malloc(len_url = strlen(using_this_store) + 80);
+	temp_xauth = malloc(len_xauth = strlen(using_this_token) + 80);
 
 	for (first = 1;;first = 0) {
+		maybe_refresh_token();
 		headers = 0;
 		if (pthread_mutex_lock(&work_mutex) < 0) {
 			fprintf(stderr,"lock failed %d\n", errno);
@@ -824,7 +889,7 @@ worker_thread(void *a)
 		if (!first)
 			curl_easy_reset(curl);
 
-		snprintf(temp_xauth, len_xauth, "X-Auth-Token: %s", my_token);
+		snprintf(temp_xauth, len_xauth, "X-Auth-Token: %s", using_this_token);
 		headers = curl_slist_append(headers, temp_xauth);
 //		headers = curl_slist_append(headers, "Content-Type: " "application/json");
 		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
@@ -834,7 +899,7 @@ worker_thread(void *a)
 //		curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void*)recvarg);
 		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, ignore_data_function);
 
-		snprintf (temp_url, len_url, "%s/%s/%s", my_store, my_container, wp->what);
+		snprintf (temp_url, len_url, "%s/%s/%s", using_this_store, my_container, wp->what);
 		memset(makedataarg, 0, sizeof *makedataarg);
 		switch (wp->op) {
 		case W_DEL:
@@ -950,8 +1015,8 @@ report_results()
 void
 free_other_stuff()
 {
-	// free my_store sometimes?
-	// free my_token sometimes?
+	if (received_storage_url) free(received_storage_url);
+	if (received_token) free(received_token);
 }
 
 int process()
@@ -959,11 +1024,6 @@ int process()
 	int r;
 	if (r = read_in_data()) {
 		fprintf(stderr,"read_in_data failed\n");
-		return r;
-	}
-	if (my_token) {
-	} else if (r = get_token()) {
-		fprintf(stderr,"get_token failed\n");
 		return r;
 	}
 	start_threads();
