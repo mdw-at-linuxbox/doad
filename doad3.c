@@ -3,11 +3,14 @@
 #include <curl/curl.h>
 #include <pthread.h>
 #include <errno.h>
+#include <time.h>
 #include <unistd.h>
 #include <string.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <json-c/json.h>
+
+extern char *strptime();
 
 char *my_method = "GET";
 char *my_user;
@@ -23,6 +26,58 @@ char *my_store;
 char *my_container;
 int vflag;
 int Vflag;
+
+char fmt[] = "%FT%T%z";
+
+char *
+convert_time(char *p, struct timespec *ts, char *errbuf)
+{
+	struct tm tb[1];
+	char *q, *xx;
+	char *x = 0;
+	int fr = 0;
+	int c = 9;
+
+	if ((q = strchr(p, '.'))) {
+		x = strdup(p);
+		memcpy(x, p, q-p);
+		xx = x+(q-p);
+		*xx = 0;
+		c = 0;
+		while (*++q) {
+			if (*q < '0' || *q > '9') break;
+			fr *= 10;
+			fr += *q-'0';
+			++c;
+		}
+		strcpy(xx, q);
+		p = x;
+	}
+	memset(ts, 0, sizeof *ts);
+	memset(tb, 0, sizeof *tb);
+	q = strptime(p, fmt, tb);
+	if (!q) {
+		sprintf (errbuf,"got NULL from strptime on %s", p);
+		if (x) free(x);
+		return errbuf;
+	}
+	if (*q) {
+		sprintf(errbuf,"failed at offset %d", q-p);
+		if (x) free(x);
+		return errbuf;
+	}
+	ts->tv_sec = timegm(tb);
+	while (c < 9) {
+		++c;
+		fr *= 10;
+	}
+	while (c > 9) {
+		--c;
+		fr /= 10;
+	}
+	ts->tv_nsec = fr;
+	return 0;
+}
 
 char *
 fix_format_microseconds(char *ts)
@@ -239,6 +294,7 @@ struct token_arg {
 	struct json_tokener *json_tokeniser;
 	char *authtoken;
 	const char *storage_url;
+	struct timespec expires_at;
 };
 
 int
@@ -306,6 +362,28 @@ eat_keystone_catalog(void *h, json_object *ep)
 	return iterate_json_array(je, eat_keystone_endpoint, h);
 }
 
+int
+eat_expires_at(void *h, json_object *ep)
+{
+	struct token_arg *a = h;
+	char errbuf[512];
+	if (json_object_is_type(ep, json_type_null)) {
+		// " does not expire "
+		memset(&a->expires_at, 0, sizeof a->expires_at);
+		return 1;
+	} else if (!json_object_is_type(ep, json_type_string)) {
+		fprintf(stderr,"weird type in expires_at entry\n");
+		return 0;
+	}
+	const char *s = json_object_get_string(ep);
+	char *e = convert_time((char *)s, &a->expires_at, errbuf);
+	if (e) {
+		fprintf(stderr,"Can't convert time from <%s>: %s\n", s, e);
+		return 0;
+	}
+	return 1;
+}
+
 uint
 eat_keystone_data(char *in, uint size, uint num, void *h)
 {
@@ -313,7 +391,7 @@ eat_keystone_data(char *in, uint size, uint num, void *h)
 	r = size * num;
 	struct token_arg *a = h;
 	json_object *jobj;
-	json_object *token, *catalog;
+	json_object *token, *catalog, *expires_at;
 	enum json_tokener_error je;
 #if 0
 	fprintf(stdout,"Received: ");
@@ -332,6 +410,13 @@ printf ("RECV: <%s>\n", response_json);
 	}
 	if (!json_object_object_get_ex(jobj, "token", &token)) {
 		fprintf(stderr,"Can't find token in response\n");
+		goto Done;
+	}
+	if (!json_object_object_get_ex(token, "expires_at", &expires_at)) {
+		fprintf(stderr,"Can't find expires_at in token from response\n");
+		goto Done;
+	}
+	if (!eat_expires_at(h, expires_at)) {
 		goto Done;
 	}
 	if (!json_object_object_get_ex(token, "catalog", &catalog)) {
@@ -468,6 +553,27 @@ if (vflag) printf ("got storage url: <%s>\n", recvarg->storage_url);
 	} else {
 		fprintf(stderr,"Failed to find storage service\n");
 		r = 1;
+	}
+	if (recvarg->expires_at.tv_sec) {
+		struct timespec now[1], dur[1];
+		if (clock_gettime(CLOCK_REALTIME, now) < 0) {
+			fprintf(stderr,"gettime failed %d\n", errno);
+			fprintf(stderr,"Token expires at %d.%09d seconds\n",
+			recvarg->expires_at.tv_sec,
+			recvarg->expires_at.tv_nsec);
+		} else {
+			dur->tv_sec = recvarg->expires_at.tv_sec - now->tv_sec;
+			dur->tv_nsec = recvarg->expires_at.tv_nsec - now->tv_nsec;
+			if (dur->tv_nsec < 0) {
+				dur->tv_sec -= 1;
+				dur->tv_nsec += 1000000000;
+			}
+			fprintf(stderr,"token expires in %d.%09d seconds\n",
+				dur->tv_sec,
+				dur->tv_nsec);
+		}
+	} else {
+		fprintf(stderr,"token does not expire\n");
 	}
 	return r;
 }
