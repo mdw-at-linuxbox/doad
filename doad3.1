@@ -1,0 +1,151 @@
+.Dd June 26, 2018
+.Dt DOAD3 1 
+.Os 
+.Sh NAME 
+.Nm doad3 
+.Nd swift test program
+.Sh SYNOPSIS 
+.Nm doad3 
+.Op Fl vwV
+.Fl b Ar bucket
+.Op Fl C Ar capath
+.Op Fl S Ar swift_storage_url
+.Op Fl T Ar keystone_token
+.Op Fl P Ar keystone_project
+.Op Fl c Ar directory
+.Op Fl u Ar keystone_user
+.Op Fl s Ar byte-count
+.Op Fl p Ar keystone_password
+.Op Fl h Ar keystone_url
+.Op Fl t Ar thread_count
+.Op Fl m Ar multicount
+.Ar 
+.Sh DESCRIPTION 
+The 
+.Nm 
+test program will efficiently create and delete objects and buckets
+in a swift container service.  Multiple threads may be started and run
+in parallel, which can greatly increase the load this application
+can generate for a swift service.
+.Pp
+Options for the
+.Nm
+program include:
+.Bl -tag -width Ds -offset 3n -compact
+.It Fl v
+Be more verbose about what is being done.
+.It Fl w
+The
+.Ic RMB
+command will wait for a bucket created in another thread
+by the same program.
+.It Fl V
+Disable peer verification for ssl connections.
+.It Fl b Ar bucket
+Specify the bucket to be used for all object operations.
+This option is mandatory, but its value is ignored for
+.Ic MKB
+and
+.Ic RMB .
+.It Fl C Ar capath
+Specify a directory containing certificates to be used
+to verify ssl connections made to swift or keystone.
+.It Fl S Ar swift_storage_url
+Specify a swift storage url.  This overrides any value
+provided in the keystone service catalog.
+.It Fl T Ar keystone_token
+Provide a keystone token.  Must be scoped for use with swift.
+This bypasses keystone v3 auth.
+.It Fl P Ar keystone_project
+Keystone project.  Required for v3 auth, which is the only form
+of keystone authentication provided for in this program.
+.It Fl c Ar directory
+Read sample contents for objects from this directory.
+.It Fl u Ar keystone_user
+Keystone user.  Required for v3 auth.
+.It Fl s Ar byte-count
+When creating objects,
+fill them with with this count of all 0 bytes, instead
+of using the contents of eponymous named files.
+.It Fl p Ar keystone_password
+Provide a keystone password.  Required for v3 auth.
+.It Fl h Ar keystone_url
+Specify a keystone url.  This is used for keystone v3 auth.
+When keystone is used, swift is by default located using the
+keystone service catalog.
+.It Fl t Ar thread_count
+Start up this many threads.  All threads run in parallel
+and consume input commands to create and remove objects.
+This is all done in parallel, and timing variations may cause
+some objects to be done in a slightly different sequence than was given as input.
+.It Fl m Ar multicount
+Discard and require a new CURL handle after this count of operations.
+The delay to acquire new ssl connections is noticeable if connections
+are not reused most of the time.
+.El
+.Pp
+Upon startup, the
+.Nm
+program reads a list of commands from standard in.  After all
+commands are read, the program starts up a requested number of
+threads and processes this list in order.  All objects th
+.Pp
+Input may include
+.Bl -tag -width ADD
+.It Ic ADD Ar objname
+A file named by the same objname will be opened and used
+as the contents for the object, unless
+.Fl s
+is used to specify a fixed size for all objects.
+If this is used, the contents are zeroed out instead.
+The
+.Fl c Ar directory
+option may be used to read files out of a different directory.
+.It Ic DEL Ar objname
+Remove this object.  This must be an object created
+earlier in the run.  When running multiple threads,
+it is possible for
+.Ic DEL
+to be processed before
+.Ic ADD .
+In this case, the thread will wait for the object to be created by a different thread.
+.It Ic MKB Ar bucket
+Make this bucket.
+Note that
+.Fl b
+must still be specified on the runline but is ignored.
+.It Ic RMB Ar bucket
+Remove this bucket.
+.El
+.Pp
+Use
+.Fl t Ar thread_count
+to request more threads for processing.  Local and remote processing
+resources, as well as available network bandwidth and latency will
+usually limit the maximum number of threads that may be used before
+total throughput drops.
+.Sh ENVIRONMENT 
+.Bl -tag -width LOGNAME
+.It Ev OS_USERNAME
+Keystone username.  Default in case the
+.Fl u
+option is not used.
+.It Ev OS_PASSWORD
+Keystone password.  Default in case the
+.Fl p
+option is not used.
+.It Ev OS_PROJECT_NAME
+Keystone project, required for v3 keystone.  Default in case the
+.Fl P
+option is not used.
+.It Ev OS_AUTH_URL
+Url for the keystone service itself.
+.It Ev OS_STORAGE_URL
+Use in place of keystone; go to this swift server directly.
+Also overrides data from the keystone service catalog, which
+would otherwise be used to locate swift.
+.It Ev OS_AUTH_TOKEN
+Bypass keystone; use this token directly.
+.El
+.Sh SEE ALSO 
+.Xr swift 1 
