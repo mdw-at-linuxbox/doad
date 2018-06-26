@@ -24,6 +24,7 @@ char *my_project;
 char *my_store;
 char *my_container;
 int vflag;
+int wflag;
 int Vflag;
 
 struct curl_carrier {
@@ -611,6 +612,8 @@ mark_it_exists(char *fn)
 
 #define W_ADD 1
 #define W_DEL 2
+#define W_MKB 3
+#define W_RMB 4
 struct work_element {
 	int op;
 	char *what;
@@ -660,6 +663,10 @@ read_in_data()
 			i = W_ADD;
 		else if (!strcmp(op, "DEL"))
 			i = W_DEL;
+		else if (!strcmp(op, "MKB"))
+			i = W_MKB;
+		else if (!strcmp(op, "RMB"))
+			i = W_RMB;
 		else {
 			fprintf (stderr,"Bad op <%s> at data line %d\n", op, lineno);
 			r = 1;
@@ -771,7 +778,10 @@ worker_thread(void *a)
 			fprintf(stderr,"unlock failed %d\n", errno);
 		}
 		if (!wp) break;
-		if (wp->op == W_DEL) {
+		switch (wp->op) {
+		case W_RMB:
+			if (!wflag) break;
+		case W_DEL:
 			wait_until_exists(wp->what);
 		}
 		if (!first)
@@ -786,12 +796,24 @@ worker_thread(void *a)
 		curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, error_buf);
 //		curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void*)recvarg);
 		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, ignore_data_function);
-
-		snprintf (temp_url, len_url, "%s/%s/%s", using_this_store, my_container, wp->what);
+		switch (wp->op) {
+		case W_ADD:
+		case W_DEL:
+			snprintf (temp_url, len_url, "%s/%s/%s", using_this_store, my_container, wp->what);
+			break;
+		case W_MKB:
+		case W_RMB:
+			snprintf (temp_url, len_url, "%s/%s", using_this_store, wp->what);
+			break;
+		}
 		memset(makedataarg, 0, sizeof *makedataarg);
 		switch (wp->op) {
 		case W_DEL:
 if (vflag) printf ("deleting %s\n", wp->what);
+			goto del;
+		case W_RMB:
+if (vflag) printf ("remove bucket %s\n", wp->what);
+		del:
 			curl_easy_setopt(curl, CURLOPT_POSTFIELDS, NULL);
 			curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, 0);
 			curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
@@ -820,6 +842,12 @@ if (vflag) printf ("adding %s\n", wp->what);
 			curl_easy_setopt(curl, CURLOPT_READFUNCTION, make_data_function);
 			curl_easy_setopt(curl, CURLOPT_READDATA, makedataarg);
 			curl_easy_setopt(curl, CURLOPT_UPLOAD, 1);
+			break;
+		case W_MKB:
+if (vflag) printf ("add bucket %s\n", wp->what);
+			curl_easy_setopt(curl, CURLOPT_POSTFIELDS, NULL);
+			curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, 0);
+			curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
 			break;
 		default:
 			fprintf(stderr,"op %d? for fn %s\n", wp->op, wp->what);
@@ -938,6 +966,9 @@ main(int ac, char **av)
 		my_url = getenv("OS_AUTH_URL");
 
 	while (--ac > 0) if (*(ap = *++av) == '-') while (*++ap) switch(*ap) {
+	case 'w':
+		++wflag;
+		break;
 	case 'v':
 		++vflag;
 		break;
@@ -1047,7 +1078,7 @@ main(int ac, char **av)
 		break;
 	default:
 	Usage:
-		fprintf(stderr,"Usage: doad3 [-u user] [-p pass] [-P proj] [-t #threads] [-h hosturl] [-C capath] [-V] [-s size] -b container\n");
+		fprintf(stderr,"Usage: doad3 [-vw] [-u user] [-p pass] [-P proj] [-t #threads] [-h hosturl] [-C capath] [-V] [-s size] -b container\n");
 		exit(1);
 	} else if (!my_url) {
 		my_url = ap;
