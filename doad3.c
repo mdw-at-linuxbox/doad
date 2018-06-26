@@ -582,12 +582,8 @@ report_on_token()
 			received_expires_at.tv_sec,
 			received_expires_at.tv_nsec);
 		} else {
-			dur->tv_sec = received_expires_at.tv_sec - now->tv_sec;
-			dur->tv_nsec = received_expires_at.tv_nsec - now->tv_nsec;
-			if (dur->tv_nsec < 0) {
-				dur->tv_sec -= 1;
-				dur->tv_nsec += 1000000000;
-			}
+			*dur = received_expires_at;
+			timespec_diff(now, dur);
 			printf("token expires in %d.%09d seconds\n",
 				dur->tv_sec,
 				dur->tv_nsec);
