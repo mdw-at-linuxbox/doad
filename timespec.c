@@ -4,7 +4,8 @@
 #include <stdlib.h>
 extern char *strptime();
 
-char fmt[] = "%FT%T%z";
+static char fmt1[] = "%FT%T";
+static char fmt2[] = "%FT%T%z";
 
 char *
 convert_time(char *p, struct timespec *ts, char *errbuf)
@@ -14,6 +15,7 @@ convert_time(char *p, struct timespec *ts, char *errbuf)
 	char *x = 0;
 	int fr = 0;
 	int c = 9;
+	char *fmt;
 
 	if ((q = strchr(p, '.'))) {
 		x = strdup(p);
@@ -27,7 +29,11 @@ convert_time(char *p, struct timespec *ts, char *errbuf)
 			fr += *q-'0';
 			++c;
 		}
-		strcpy(xx, q);
+		fmt = fmt1;
+		if (*q != 'Z') {
+			strcpy(xx, q);
+			fmt = fmt2;
+		}
 		p = x;
 	}
 	memset(ts, 0, sizeof *ts);
@@ -39,7 +45,7 @@ convert_time(char *p, struct timespec *ts, char *errbuf)
 		return errbuf;
 	}
 	if (*q) {
-		sprintf(errbuf,"failed at offset %d", q-p);
+		sprintf(errbuf,"failed at offset %d: %s", q-p, q);
 		if (x) free(x);
 		return errbuf;
 	}
