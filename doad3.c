@@ -69,7 +69,8 @@ get_curl_handle()
 void
 release_curl_handle_now(struct curl_carrier *ca)
 {
-	curl_easy_cleanup(ca->h);
+	if (ca)
+		curl_easy_cleanup(ca->h);
 	free(ca);
 }
 
@@ -77,6 +78,7 @@ void
 release_curl_handle(struct curl_carrier *ca)
 {
 	int i;
+	if (!ca) return;
 	if (++ca->uses > multi_count) {
 		release_curl_handle_now(ca);
 		return;
@@ -92,7 +94,7 @@ release_curl_handle(struct curl_carrier *ca)
 		ca = 0;
 	}
 	pthread_mutex_unlock(&saved_mutex);
-	if (ca) release_curl_handle_now(ca);
+	release_curl_handle_now(ca);
 }
 
 int cleaner_shutdown;
@@ -188,6 +190,7 @@ struct token_arg {
 	char *authtoken;
 	const char *storage_url;
 	struct timespec expires_at;
+	int v1;
 };
 
 int
@@ -290,6 +293,10 @@ eat_keystone_data(char *in, uint size, uint num, void *h)
 	fprintf(stdout,"Received: ");
 	r = fwrite(in, 1, r, stdout);
 #endif
+	if (!a->json_tokeniser) {
+		fprintf(stderr, "??? got data %d<%.*s>\n", r, r, in);
+		return r;
+	}
 	jobj = json_tokener_parse_ex(a->json_tokeniser, in, r);
 	je = json_tokener_get_error(a->json_tokeniser);
 	if (je != json_tokener_success) {
@@ -328,9 +335,15 @@ eat_keystone_header(char *buffer, uint size, uint num, void *h)
 {
 	uint r;
 	static char subjecttoken[] = "X-Subject-Token:";
+	static char storagetoken[] = "X-Storage-Token:";
+	static char storageurl[] = "X-Storage-Url:";
 	r = size * num;
 	struct token_arg *a = h;
 	if (!strncasecmp(buffer, subjecttoken, sizeof subjecttoken-1)) {
+		if (a->v1) {
+			fprintf(stderr,"Weird: found subject token in v1 auth response\n");
+			return r;
+		}
 		char *cp = malloc(r + 5);
 		char *inp = buffer; uint s = r;
 		inp += sizeof subjecttoken-1;
@@ -346,6 +359,48 @@ eat_keystone_header(char *buffer, uint size, uint num, void *h)
 			inp = strchr(cp, '\n');
 			if (inp) *inp = 0;
 			a->authtoken = cp;
+		}
+	} else if (!strncasecmp(buffer, storagetoken, sizeof storagetoken-1)) {
+		if (!a->v1) {
+			fprintf(stderr,"Weird: found storage token in non-v1 auth response\n");
+			return r;
+		}
+		char *cp = malloc(r + 5);
+		char *inp = buffer; uint s = r;
+		inp += sizeof storagetoken-1;
+		s -= sizeof storagetoken-1;
+		while (s && *inp == ' ') {
+			--s; ++inp;
+		}
+		if (s) {
+			memcpy(cp, inp, s);
+			cp[s] = 0;
+			inp = strchr(cp, '\r');
+			if (inp) *inp = 0;
+			inp = strchr(cp, '\n');
+			if (inp) *inp = 0;
+			a->authtoken = cp;
+		}
+	} else if (!strncasecmp(buffer, storageurl, sizeof storageurl-1)) {
+		if (!a->v1) {
+			fprintf(stderr,"Weird: found storage url in non-v1 auth response\n");
+			return r;
+		}
+		char *cp = malloc(r + 5);
+		char *inp = buffer; uint s = r;
+		inp += sizeof storageurl-1;
+		s -= sizeof storageurl-1;
+		while (s && *inp == ' ') {
+			--s; ++inp;
+		}
+		if (s) {
+			memcpy(cp, inp, s);
+			cp[s] = 0;
+			inp = strchr(cp, '\r');
+			if (inp) *inp = 0;
+			inp = strchr(cp, '\n');
+			if (inp) *inp = 0;
+			a->storage_url = cp;
 		}
 	}
 	return r;
@@ -380,9 +435,36 @@ get_token()
 	json_object *jdom = json_object_new_object();
 	json_object *jobj = json_object_new_object();
 	json_object *jproj = json_object_new_object();
+	char *cp;
+	char *temp_store = 0;
+	const char *req_json = json_object_to_json_string_ext(jobj, JSON_C_TO_STRING_PLAIN);
 
+	memset(recvarg, 0, sizeof *recvarg);
 	temp_url = malloc(i = strlen(my_url) + 30);
-	snprintf(temp_url, i, "%s/auth/tokens", my_url);
+	if ((cp = strstr(my_url, "auth"))) {
+		snprintf(temp_url, i, "%s", my_url);
+		recvarg->v1 = 1;
+	} else {
+		snprintf(temp_url, i, "%s/auth/tokens", my_url);
+	}
+
+	if (recvarg->v1) {
+		if (vflag > 1) printf ("SEND empty data; v1\n");
+		int len, i;
+		len = 50 + strlen(my_password) + strlen(my_user);
+		temp_store = malloc(len);
+		cp = temp_store;
+		snprintf (cp, len, "x-auth-key: %s", my_password);
+		headers = curl_slist_append(headers, cp);
+		i = strlen(cp) + 1;
+		len -= i;
+		cp += i;
+		snprintf (cp, len, "x-auth-user: %s", my_user);
+		headers = curl_slist_append(headers, cp);
+		i = strlen(cp) + 1;
+		len -= i;
+		cp += i;
+	} else {
 	json_object_object_add(jdom, "name", json_object_new_string("Default"));
 	json_object_array_add(jm, json_object_new_string("password"));
 //	json_object_object_add(jx, "name", json_object_new_string("Default"));
@@ -399,18 +481,18 @@ get_token()
 	json_object_object_add(jz, "identity", jt);
 	json_object_object_add(jz, "scope", jx);
 	json_object_object_add(jobj, "auth", jz);
-
-	const char *req_json = json_object_to_json_string_ext(jobj, JSON_C_TO_STRING_PLAIN);
-	memset(recvarg, 0, sizeof *recvarg);
 	recvarg->json_tokeniser = json_tokener_new();
-if (vflag > 1) printf ("SEND: <%s>\n", req_json);
 	headers = curl_slist_append(headers, "Content-Type: " "application/json");
 	headers = curl_slist_append(headers, "Accept: " "application/json");
 	headers = curl_slist_append(headers, "Expect:");
+	if (vflag > 1) printf ("SEND: <%s>\n", req_json);
+	}
 	ca = get_curl_handle();
 	if (!ca) return 1;
 	curl = ca->h;
-//	curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, my_method);
+	if (recvarg->v1) {
+		curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, my_method);
+	}
 	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 	curl_easy_setopt(curl, CURLOPT_URL, temp_url);
 	curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 1L);
@@ -418,8 +500,10 @@ if (vflag > 1) printf ("SEND: <%s>\n", req_json);
 	curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, error_buf);
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void*)recvarg);
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, eat_keystone_data);
-	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, req_json);
-	curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, strlen(req_json));
+	if (recvarg->v1) {
+		curl_easy_setopt(curl, CURLOPT_POSTFIELDS, req_json);
+		curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, strlen(req_json));
+	}
 	curl_easy_setopt(curl, CURLOPT_HEADERDATA, (void*)recvarg);
 	curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, eat_keystone_header);
 	if (Vflag) {
@@ -439,6 +523,8 @@ Done:
 	release_curl_handle(ca);
 	curl_slist_free_all(headers);
 //	free(req_json);
+	if (temp_store)
+		free(temp_store);
 	if (temp_url) free(temp_url);
 	if (recvarg->authtoken) {
 		if (received_token)
@@ -451,7 +537,12 @@ Done:
 	if (recvarg->storage_url) {
 		if (received_storage_url)
 			free(received_storage_url);
-		received_storage_url = strdup(recvarg->storage_url);	// free?
+		if (recvarg->v1) {
+			received_storage_url = (char *) recvarg->storage_url;
+			recvarg->storage_url = 0;
+		} else {
+			received_storage_url = strdup(recvarg->storage_url);	// free?
+		}
 	} else {
 		fprintf(stderr,"Failed to find storage service\n");
 		r = 1;
@@ -731,7 +822,7 @@ struct worker_result {
 void *
 worker_thread(void *a)
 {
-	struct curl_carrier *ca;
+	struct curl_carrier *ca = 0;
 	CURL *curl;
 	struct curl_slist *headers;
 	CURLcode rc;
@@ -741,11 +832,11 @@ worker_thread(void *a)
 	int len_xauth;
 	int len_timestamp;
 	int r;
-	struct worker_result *wr;
+	struct worker_result *wr = 0;
 	struct work_element *wp;
 	struct work_element **wpp;
-	char *temp_url;
-	char *temp_xauth;
+	char *temp_url = 0;
+	char *temp_xauth = 0;
 	char temp_timestamp[80];
 	char timestamp_formatted[60];
 	CURLoption opt;
@@ -758,6 +849,14 @@ worker_thread(void *a)
 	maybe_refresh_token();
 	using_this_store = my_store ? my_store : received_storage_url;
 	using_this_token = my_token ? my_token : received_token;
+	if (!using_this_store) {
+		fprintf(stderr,"No store so doing no work\n");
+		goto Done;
+	}
+	if (!using_this_token) {
+		fprintf(stderr,"No token so doing no work\n");
+		goto Done;
+	}
 	wr = malloc(sizeof *wr);
 	ca = get_curl_handle();
 	curl = ca->h;
@@ -867,7 +966,10 @@ if (vflag) printf ("add bucket %s\n", wp->what);
 			fclose(makedataarg->fp);
 		if (http_status < 200 || http_status > 299) {
 			fprintf (stderr,"While %s on %s: got %d\n",
-				wp->op==W_ADD ? "adding" : "deleting",
+				wp->op==W_MKB ? "making bucket" :
+				wp->op==W_RMB ? "removing bucket" :
+				wp->op==W_ADD ? "adding" :
+				wp->op==W_DEL ? "deleting" : "???",
 				wp->what,
 				(int) http_status);
 		}
@@ -882,7 +984,8 @@ Done:
 	release_curl_handle(ca);
 	free(temp_url);
 	free(temp_xauth);
-	if (r) {
+	if (!wr) {
+	} else if (r) {
 		wr->r = r;
 	} else {
 		free(wr);
@@ -955,15 +1058,6 @@ main(int ac, char **av)
 	char *msg;
 	int r;
 	char *change_here = 0;
-
-	if (!my_user)
-		my_user = getenv("OS_USERNAME");
-	if (!my_password)
-		my_password = getenv("OS_PASSWORD");
-	if (!my_project)
-		my_project = getenv("OS_PROJECT_NAME");
-	if (!my_url)
-		my_url = getenv("OS_AUTH_URL");
 
 	while (--ac > 0) if (*(ap = *++av) == '-') while (*++ap) switch(*ap) {
 	case 'w':
@@ -1094,6 +1188,7 @@ main(int ac, char **av)
 		fprintf(stderr,"must specific -b container\n");
 		goto Usage;
 	}
+
 	if (!my_user)
 		my_user = getenv("OS_USERNAME");
 	if (!my_password)
@@ -1106,6 +1201,14 @@ main(int ac, char **av)
 		my_store = getenv("OS_STORAGE_URL");
 	if (!my_token)
 		my_token = getenv("OS_AUTH_TOKEN");
+
+	// antique swift / ceph v1.0
+	if (!my_user)
+		my_user = getenv("ST_USER");
+	if (!my_password)
+		my_password = getenv("ST_KEY");
+	if (!my_url)
+		my_url = getenv("ST_AUTH");
 
 	if (!change_here)
 		;
