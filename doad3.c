@@ -325,6 +325,7 @@ printf ("RECV: <%s>\n", response_json);
 	}
 	iterate_json_array(catalog, eat_keystone_catalog, h);
 Done:
+	json_object_put(jobj);
 	return r;
 }
 
@@ -437,7 +438,7 @@ get_token()
 	json_object *jproj = json_object_new_object();
 	char *cp;
 	char *temp_store = 0;
-	const char *req_json = json_object_to_json_string_ext(jobj, JSON_C_TO_STRING_PLAIN);
+	const char *req_json;
 
 	memset(recvarg, 0, sizeof *recvarg);
 	temp_url = malloc(i = strlen(my_url) + 30);
@@ -445,7 +446,10 @@ get_token()
 		snprintf(temp_url, i, "%s", my_url);
 		recvarg->v1 = 1;
 	} else {
-		snprintf(temp_url, i, "%s/auth/tokens", my_url);
+		char *cp = my_url + strlen(my_url);
+		if (*my_url) --cp;
+		snprintf(temp_url, i, "%s%s", my_url,
+		"/auth/tokens" + (*cp == '/'));
 	}
 
 	if (recvarg->v1) {
@@ -465,33 +469,37 @@ get_token()
 		len -= i;
 		cp += i;
 	} else {
-	json_object_object_add(jdom, "name", json_object_new_string("Default"));
+	json_object_object_add(jdom, "id", json_object_new_string("default"));
 	json_object_array_add(jm, json_object_new_string("password"));
-//	json_object_object_add(jx, "name", json_object_new_string("Default"));
-//	json_object_object_add(jpu, "domain", jx);
-	json_object_object_add(jpu, "domain", jdom);
+//	json_object_object_add(jx, "name", json_object_new_string("default"));
+	json_object_object_add(jpu, "name", json_object_new_string(my_user));
+	json_object_object_add(jpu, "domain", json_object_get(jdom));
 	json_object_object_add(jproj, "name", json_object_new_string(my_project));
 	json_object_object_add(jproj, "domain", jdom);
 	json_object_object_add(jx, "project", jproj);
-	json_object_object_add(jpu, "name", json_object_new_string(my_user));
+//	json_object_object_add(jpu, "domain", jx);
 	json_object_object_add(jpu, "password", json_object_new_string(my_password));
 	json_object_object_add(jy, "user", jpu);
-	json_object_object_add(jt, "password", jy);
 	json_object_object_add(jt, "methods", jm);
+	json_object_object_add(jt, "password", jy);
 	json_object_object_add(jz, "identity", jt);
 	json_object_object_add(jz, "scope", jx);
 	json_object_object_add(jobj, "auth", jz);
+	req_json = json_object_to_json_string_ext(jobj, JSON_C_TO_STRING_PLAIN);
 	recvarg->json_tokeniser = json_tokener_new();
 	headers = curl_slist_append(headers, "Content-Type: " "application/json");
 	headers = curl_slist_append(headers, "Accept: " "application/json");
 	headers = curl_slist_append(headers, "Expect:");
 	if (vflag > 1) printf ("SEND: <%s>\n", req_json);
 	}
+	if (vflag > 1) printf ("URL: <%s>\n", temp_url);
 	ca = get_curl_handle();
 	if (!ca) return 1;
 	curl = ca->h;
 	if (recvarg->v1) {
 		curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, my_method);
+	} else {
+		curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "POST");
 	}
 	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 	curl_easy_setopt(curl, CURLOPT_URL, temp_url);
@@ -500,7 +508,7 @@ get_token()
 	curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, error_buf);
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void*)recvarg);
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, eat_keystone_data);
-	if (recvarg->v1) {
+	if (1 || recvarg->v1) {
 		curl_easy_setopt(curl, CURLOPT_POSTFIELDS, req_json);
 		curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, strlen(req_json));
 	}
@@ -547,7 +555,10 @@ Done:
 		fprintf(stderr,"Failed to find storage service\n");
 		r = 1;
 	}
+	if (recvarg->json_tokeniser)
+		json_tokener_free(recvarg->json_tokeniser);
 	received_expires_at = recvarg->expires_at;
+	json_object_put(jobj);
 	return r;
 }
 
